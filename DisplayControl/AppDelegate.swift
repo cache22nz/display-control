@@ -202,6 +202,11 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
     if flags.rawValue & CGDisplayChangeSummaryFlags.AddFlag.rawValue > 0 {
         // Add new display to displayList & update menu
         
+        guard !appDelegate.displayList.contains({$0.ID == displayID}) else {
+            NSLog("'AddDisplay' called for already scanned display; this shouldn't happen")
+            return
+        }
+        
         appDelegate.displayList.append(DisplayData(fromDisplayID: displayID))
         if menuFontPixelWidth(appDelegate.displayList.last!.label) > appDelegate.largestDisplayLabelPixelWidth {
             appDelegate.largestDisplayLabelPixelWidth = menuFontPixelWidth(appDelegate.displayList.last!.label)
@@ -221,6 +226,12 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
 
     } else if flags.rawValue & CGDisplayChangeSummaryFlags.RemoveFlag.rawValue > 0 {
         // Remove display from displayList and update menu
+        
+        guard appDelegate.displayList.contains({$0.ID == displayID}) else {
+            NSLog("'RemoveDisplay' called for unscanned display; this shouldn't happen")
+            return
+        }
+        
         let removedDisplayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
         appDelegate.displayList.removeAtIndex(removedDisplayIndex)
         
@@ -246,28 +257,69 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
     
     if flags.rawValue & CGDisplayChangeSummaryFlags.SetModeFlag.rawValue > 0 {
         
-        let displayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
-        let display = appDelegate.displayList[displayIndex]
+        guard appDelegate.displayList.contains({$0.ID == displayID}) else {
+            NSLog("'SetMode' called for unscanned display; this shouldn't happen")
+            return
+        }
+        
         let newMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(displayID)!)
-        let newModeIndex = display.availableModes.indexOf(newMode)
-        
+        let displayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
         let displayMenu = appDelegate.menu.itemWithTag(displayIndex)!
-        displayMenu.submenu?.itemWithTag(display.currentModeIndex)?.state = 0
-        displayMenu.submenu?.itemAtIndex(newModeIndex!)?.state = 1
+        let display = appDelegate.displayList[displayIndex]
+
+        // shouldn't assume the new resolution is in the list. Check, rescan and rebuild menu if necessary.
+        if !display.availableModes.contains(newMode) {
+            
+            NSLog("New mode for display \(display.label) (\(displayID)) not detected in original scan: \(newMode.width) x \(newMode.height) @ \(newMode.refreshRate)Hz")
+            appDelegate.displayList[displayIndex] = DisplayData(fromDisplayID: displayID)
+            displayMenu.submenu = appDelegate.buildDisplayMenu(displayID, tag: displayIndex).submenu
+            
+        } else {
+            
+            let newModeIndex = display.availableModes.indexOf(newMode)
+            
+            displayMenu.submenu?.itemWithTag(display.currentModeIndex)?.state = 0
+            displayMenu.submenu?.itemAtIndex(newModeIndex!)?.state = 1
+            
+            appDelegate.displayList[displayIndex].currentMode = newMode
+            appDelegate.displayList[displayIndex].currentModeIndex = newModeIndex!
+        }
+
         displayMenu.attributedTitle = NSAttributedString(string: display.label + "\t\(newMode.width)\t× \(newMode.height)", attributes: [NSParagraphStyleAttributeName: appDelegate.displayMenuParagraphStyle, NSFontAttributeName: NSFont.menuFontOfSize(0)])
-        appDelegate.displayList[displayIndex].currentMode = newMode
-        appDelegate.displayList[displayIndex].currentModeIndex = newModeIndex!
-        
+
     }
     
     if flags.rawValue & CGDisplayChangeSummaryFlags.MirrorFlag.rawValue > 0 {
         
+        guard appDelegate.displayList.count > 1 else {
+            NSLog("'MirrorDisplays' called with less than 2 displays connected; this shouldn't happen")
+            return
+        }
+        
         appDelegate.menu.itemWithTag(kMirrorTag)?.title = "Disable Mirroring"
+        if #available(OSX 10.10, *) {
+            if let button = appDelegate.statusItem.button {
+                button.image = NSImage(named: "StatusBarBlueButtonImage")
+            }
+        } else {
+            // Fallback on earlier versions
+            appDelegate.statusItem.image = NSImage(named: "StatusBarBlueButtonImage")
+        }
+
         NSLog("Mirroring activated")
 
     } else if flags.rawValue & CGDisplayChangeSummaryFlags.UnMirrorFlag.rawValue > 0 {
         
         appDelegate.menu.itemWithTag(kMirrorTag)?.title = "Enable Mirroring"
+        if #available(OSX 10.10, *) {
+            if let button = appDelegate.statusItem.button {
+                button.image = NSImage(named: "StatusBarButtonImage")
+            }
+        } else {
+            // Fallback on earlier versions
+            appDelegate.statusItem.image = NSImage(named: "StatusBarButtonImage")
+        }
+
         NSLog("Mirroring deactivated")
     }
 }
@@ -292,49 +344,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(aNotification: NSNotification) {
         // Insert code here to initialize your application
         
-        if let button = statusItem.button {
-            button.image = NSImage(named: "StatusBarButtonImage")
-            
-            CGResult = CGGetOnlineDisplayList(maxDisplays, nil, &displayCount)
-            
-            var onlineDisplays = [CGDirectDisplayID](count: Int(displayCount), repeatedValue: 0)
-            CGResult = CGGetOnlineDisplayList(displayCount, &onlineDisplays, &displayCount)
-            
-            for displayID in onlineDisplays {
-                displayList.append(DisplayData(fromDisplayID: displayID))
-                if menuFontPixelWidth(displayList.last!.label) > largestDisplayLabelPixelWidth {
-                    largestDisplayLabelPixelWidth = menuFontPixelWidth(displayList.last!.label)
-                }
+        if #available(OSX 10.10, *) {
+            if let button = statusItem.button {
+                button.image = NSImage(named: "StatusBarButtonImage")
             }
-            
-            /* Build menus */
-            configureDisplayMenuParagraphStyle()
-            configureResolutionMenuParagraphStyle()
-
-            displayList.sortInPlace({$0.ID < $1.ID})
-            
-            var i = 0
-            for display in displayList {
-                menu.addItem(buildDisplayMenu(display.ID, tag: i))
-                i++
-            }
-            
-            menu.addItem(NSMenuItem.separatorItem())
-            
-            if displayList.filter({$0.isInMirrorSet}).count == 0 {
-                menu.addItem(NSMenuItem(title: "Enable Mirroring", action: Selector("toggleMirroring:"), keyEquivalent: ""))
-            } else {
-                menu.addItem(NSMenuItem(title: "Disable Mirroring", action: Selector("toggleMirroring:"), keyEquivalent: ""))
-            }
-            menu.itemArray.last?.tag = kMirrorTag
-            
-            menu.addItem(NSMenuItem.separatorItem())
-            menu.addItem(NSMenuItem(title: "Quit Display Control", action: Selector("terminate:"), keyEquivalent: ""))
-            
-            statusItem.menu = menu
+        } else {
+            // Fallback on earlier versions
+            statusItem.image = NSImage(named: "StatusBarButtonImage")
         }
         
-         callbackIsSet = (CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, nil).rawValue == 1)
+        CGResult = CGGetOnlineDisplayList(maxDisplays, nil, &displayCount)
+        
+        var onlineDisplays = [CGDirectDisplayID](count: Int(displayCount), repeatedValue: 0)
+        CGResult = CGGetOnlineDisplayList(displayCount, &onlineDisplays, &displayCount)
+        
+        for displayID in onlineDisplays {
+            displayList.append(DisplayData(fromDisplayID: displayID))
+            if menuFontPixelWidth(displayList.last!.label) > largestDisplayLabelPixelWidth {
+                largestDisplayLabelPixelWidth = menuFontPixelWidth(displayList.last!.label)
+            }
+        }
+        
+        /* Build menus */
+        configureDisplayMenuParagraphStyle()
+        configureResolutionMenuParagraphStyle()
+
+        displayList.sortInPlace({$0.ID < $1.ID})
+        
+        var i = 0
+        for display in displayList {
+            menu.addItem(buildDisplayMenu(display.ID, tag: i))
+            i++
+        }
+        
+        menu.addItem(NSMenuItem.separatorItem())
+        
+        if displayList.filter({$0.isInMirrorSet}).count == 0 {
+            menu.addItem(NSMenuItem(title: "Enable Mirroring", action: Selector("toggleMirroring:"), keyEquivalent: ""))
+        } else {
+            menu.addItem(NSMenuItem(title: "Disable Mirroring", action: Selector("toggleMirroring:"), keyEquivalent: ""))
+        }
+        menu.itemArray.last?.tag = kMirrorTag
+        
+        menu.addItem(NSMenuItem.separatorItem())
+        menu.addItem(NSMenuItem(title: "Quit Display Control", action: Selector("terminate:"), keyEquivalent: ""))
+        
+        statusItem.menu = menu
+        
+        callbackIsSet = (CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, nil).rawValue == 1)
     }
     
     
@@ -479,11 +536,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         resolutionMenuParagraphStyle.addTabStop(NSTextTab(type: NSTextTabType.RightTabStopType, location: menuFontPixelWidth("00000") + 5))
         resolutionMenuParagraphStyle.addTabStop(NSTextTab(type: NSTextTabType.LeftTabStopType, location: resolutionMenuParagraphStyle.tabStops[0].location + menuFontPixelWidth(" ")))
         resolutionMenuParagraphStyle.addTabStop(NSTextTab(type: NSTextTabType.LeftTabStopType, location: resolutionMenuParagraphStyle.tabStops[1].location + menuFontPixelWidth("× 00000") + 30))
-    }
-    
-    
-    func logToConsole(sender: AnyObject) {
-        NSLog("Display Control button activated")
     }
     
     
