@@ -25,10 +25,11 @@ extension Array {
     }
 }
 
-let kCGErrorSuccess : Int32 = 0
 let kCGNullDirectDisplay = CGDirectDisplayID(0)
 let kIONull = io_object_t(0)
 let kMirrorTag = 88
+let kMaxDisplays : UInt32 = 255
+
 
 struct CGDisplayModeTuple: Hashable {
     var width: Int
@@ -162,6 +163,7 @@ struct DisplayData {
     var isBuiltin : Bool { return CGDisplayIsBuiltin(ID) == 1 }
     var isMain : Bool { return CGDisplayIsMain(ID) == 1 }
     var isInMirrorSet : Bool { return CGDisplayIsInMirrorSet(ID) == 1 }
+    var isOnline : Bool { return CGDisplayIsOnline(ID) == 1 }
     var currentMode : CGDisplayModeTuple
     var currentModeIndex : Int = 0
     var availableModes : [CGDisplayModeTuple] = []
@@ -170,18 +172,21 @@ struct DisplayData {
         ID = displayID
         label = displayModelName(displayID)
         
-        let CFAvailableModes = CGDisplayCopyAllDisplayModes(displayID, nil)
-        let rawModes = Array.fromCFArray(CFAvailableModes)!.filter({CGDisplayModeIsUsableForDesktopGUI($0)})
-        
-        var filteredModes : Set<CGDisplayModeTuple> = []
-        for mode in rawModes {
-            filteredModes.insert(CGDisplayModeTuple(mode: mode!))
+        if let CFAvailableModes = CGDisplayCopyAllDisplayModes(displayID, nil) {
+            let rawModes = Array.fromCFArray(CFAvailableModes)!.filter({CGDisplayModeIsUsableForDesktopGUI($0)})
+            
+            var filteredModes : Set<CGDisplayModeTuple> = []
+            for mode in rawModes {
+                filteredModes.insert(CGDisplayModeTuple(mode: mode!))
+            }
+            
+            availableModes = Array(filteredModes).sort({$0 < $1})
+            
+            currentMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(displayID)!)
+            currentModeIndex = availableModes.indexOf({$0 == currentMode})!
+        } else {
+            currentMode = CGDisplayModeTuple(0, 0, 0.0)
         }
-        
-        availableModes = Array(filteredModes).sort({$0 < $1})
-        
-        currentMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(displayID)!)
-        currentModeIndex = availableModes.indexOf({$0 == currentMode})!
     }
 }
 
@@ -189,15 +194,17 @@ struct DisplayData {
 func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags, userInfo: UnsafeMutablePointer<Void>) -> Void {
     
     let appDelegate = NSApplication.sharedApplication().delegate as! AppDelegate
+    var display: DisplayData
     
-    var displayLabel: String
     if appDelegate.displayList.filter({$0.ID == displayID}).count > 0 {
-        displayLabel = appDelegate.displayList[appDelegate.displayList.indexOf({$0.ID == displayID})!].label
+        display = appDelegate.displayList.filter({$0.ID == displayID}).first!
     } else {
-        displayLabel = displayModelName(displayID)
+        display = DisplayData(fromDisplayID: displayID)
+        NSLog("New display detected: \(display.label) (\(displayID))")
     }
-
-    NSLog("Display reconfiguration callback called for display \(displayLabel) (\(displayID)): flags = \(flags.rawValue)")
+    
+    
+    NSLog("Display reconfiguration callback called for display \(display.label) (\(displayID)): flags = \(flags.rawValue)")
 
     if flags.rawValue & CGDisplayChangeSummaryFlags.AddFlag.rawValue > 0 {
         // Add new display to displayList & update menu
@@ -207,22 +214,15 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
             return
         }
         
-        appDelegate.displayList.append(DisplayData(fromDisplayID: displayID))
-        if menuFontPixelWidth(appDelegate.displayList.last!.label) > appDelegate.largestDisplayLabelPixelWidth {
-            appDelegate.largestDisplayLabelPixelWidth = menuFontPixelWidth(appDelegate.displayList.last!.label)
-            appDelegate.configureDisplayMenuParagraphStyle()
-        }
+        appDelegate.displayList.append(display)
         appDelegate.displayList.sortInPlace({$0.ID < $1.ID})
-        let newDisplayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
-        appDelegate.menu.insertItem(appDelegate.buildDisplayMenu(displayID, tag: newDisplayIndex), atIndex: newDisplayIndex)
-        
-        var i = 0
-        for _ in appDelegate.displayList {
-            appDelegate.menu.itemAtIndex(i)!.tag = i
-            i++
+        appDelegate.configureDisplayMenuParagraphStyle()
+        if let newDisplayIndex = appDelegate.displayList.indexOf({$0.ID == displayID}) {
+            appDelegate.menu.insertItem(appDelegate.buildDisplayMenu(displayID), atIndex: newDisplayIndex)
         }
+
+        NSLog("Display connected: \(display.label) (\(displayID))")
         
-        NSLog("Display connected: \(displayLabel) (\(displayID))")
 
     } else if flags.rawValue & CGDisplayChangeSummaryFlags.RemoveFlag.rawValue > 0 {
         // Remove display from displayList and update menu
@@ -235,25 +235,16 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
         let removedDisplayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
         appDelegate.displayList.removeAtIndex(removedDisplayIndex)
         
-        appDelegate.largestDisplayLabelPixelWidth = 0
-        for display in appDelegate.displayList {
-            if menuFontPixelWidth(display.label) > appDelegate.largestDisplayLabelPixelWidth {
-                appDelegate.largestDisplayLabelPixelWidth = menuFontPixelWidth(display.label)
-            }
+        if appDelegate.menu.itemWithTag(Int(displayID)) != nil {
+            // change menu paragraph style before removing menu, so it takes effect when the removal triggers a refresh
+            appDelegate.configureDisplayMenuParagraphStyle()
+            
+            appDelegate.menu.removeItem(appDelegate.menu.itemWithTag(Int(displayID))!)
         }
-
-        appDelegate.configureDisplayMenuParagraphStyle()
         
-        appDelegate.menu.removeItemAtIndex(appDelegate.menu.indexOfItem(appDelegate.menu.itemWithTag(removedDisplayIndex)!))
-        
-        var i = 0
-        for _ in appDelegate.displayList {
-            appDelegate.menu.itemAtIndex(i)!.tag = i
-            i++
-        }
-
-        NSLog("Display removed: \(displayLabel) (\(displayID))")
+        NSLog("Display removed: \(display.label) (\(displayID))")
     }
+
     
     if flags.rawValue & CGDisplayChangeSummaryFlags.SetModeFlag.rawValue > 0 {
         
@@ -262,32 +253,42 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
             return
         }
         
-        let newMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(displayID)!)
         let displayIndex = appDelegate.displayList.indexOf({$0.ID == displayID})!
-        let displayMenu = appDelegate.menu.itemWithTag(displayIndex)!
-        let display = appDelegate.displayList[displayIndex]
-
-        // shouldn't assume the new resolution is in the list. Check, rescan and rebuild menu if necessary.
-        if !display.availableModes.contains(newMode) {
-            
-            NSLog("New mode for display \(display.label) (\(displayID)) not detected in original scan: \(newMode.width) x \(newMode.height) @ \(newMode.refreshRate)Hz")
-            appDelegate.displayList[displayIndex] = DisplayData(fromDisplayID: displayID)
-            displayMenu.submenu = appDelegate.buildDisplayMenu(displayID, tag: displayIndex).submenu
-            
-        } else {
-            
-            let newModeIndex = display.availableModes.indexOf(newMode)
-            
-            displayMenu.submenu?.itemWithTag(display.currentModeIndex)?.state = 0
-            displayMenu.submenu?.itemAtIndex(newModeIndex!)?.state = 1
-            
-            appDelegate.displayList[displayIndex].currentMode = newMode
-            appDelegate.displayList[displayIndex].currentModeIndex = newModeIndex!
+        
+        guard display.isOnline else {
+            NSLog("'SetMode' called for offline display; this shouldn't happen")
+            return
         }
+        
+        if let displayMenu = appDelegate.menu.itemWithTag(Int(displayID)) {
+            if let newCGMode = CGDisplayCopyDisplayMode(displayID) {
+                let newMode = CGDisplayModeTuple(mode: newCGMode)
 
-        displayMenu.attributedTitle = NSAttributedString(string: display.label + "\t\(newMode.width)\t× \(newMode.height)", attributes: [NSParagraphStyleAttributeName: appDelegate.displayMenuParagraphStyle, NSFontAttributeName: NSFont.menuFontOfSize(0)])
+                // shouldn't assume the new resolution is in the list. Check, rescan and rebuild menu if necessary.
+                if !display.availableModes.contains(newMode) {
+                    
+                    NSLog("New mode for display \(display.label) (\(displayID)) not detected in original scan: \(newMode.width) x \(newMode.height) @ \(newMode.refreshRate)Hz")
+                    appDelegate.displayList[displayIndex] = DisplayData(fromDisplayID: displayID)
+                    displayMenu.submenu = appDelegate.buildDisplayMenu(displayID).submenu
 
+                } else {
+                    
+                    let newModeIndex = display.availableModes.indexOf(newMode)
+                    
+                    displayMenu.submenu?.itemWithTag(display.currentModeIndex)?.state = 0
+                    displayMenu.submenu?.itemAtIndex(newModeIndex!)?.state = 1
+                    
+                    appDelegate.displayList[displayIndex].currentMode = newMode
+                    appDelegate.displayList[displayIndex].currentModeIndex = newModeIndex!
+                }
+
+                displayMenu.attributedTitle = NSAttributedString(string: display.label + "\t\(newMode.width)\t× \(newMode.height)", attributes: [NSParagraphStyleAttributeName: appDelegate.displayMenuParagraphStyle, NSFontAttributeName: NSFont.menuFontOfSize(0)])
+            }
+        } else {
+            NSLog("'SetMode' called for display that has no menu; this shouldn't happen")
+        }
     }
+    
     
     if flags.rawValue & CGDisplayChangeSummaryFlags.MirrorFlag.rawValue > 0 {
         
@@ -322,6 +323,17 @@ func displayReconfigurationCallback (displayID: CGDirectDisplayID, flags: CGDisp
 
         NSLog("Mirroring deactivated")
     }
+    
+    // Check stored display list for consistency
+    for display in appDelegate.displayList {
+        if !display.isOnline {
+            if appDelegate.menu.itemWithTag(Int(display.ID)) != nil {
+                appDelegate.menu.removeItem(appDelegate.menu.itemWithTag(Int(display.ID))!)
+            }
+            
+            appDelegate.displayList.removeAtIndex(appDelegate.displayList.indexOf({$0.ID == display.ID})!)
+        }
+    }
 }
 
 
@@ -331,12 +343,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @IBOutlet weak var window: NSWindow!
     
     let statusItem = NSStatusBar.systemStatusBar().statusItemWithLength(NSSquareStatusItemLength)
-    let maxDisplays : UInt32 = 255
     let menu = NSMenu()
-    var CGResult : CGError?
-    var displayCount : UInt32 = 0
     var displayList : [DisplayData] = []
-    var callbackIsSet : Bool = false
+    var callbackRegistered : Bool = false
     var largestDisplayLabelPixelWidth: CGFloat = 0.0
     let displayMenuParagraphStyle = NSMutableParagraphStyle()
     let resolutionMenuParagraphStyle = NSMutableParagraphStyle()
@@ -353,28 +362,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.image = NSImage(named: "StatusBarButtonImage")
         }
         
-        CGResult = CGGetOnlineDisplayList(maxDisplays, nil, &displayCount)
-        
-        var onlineDisplays = [CGDirectDisplayID](count: Int(displayCount), repeatedValue: 0)
-        CGResult = CGGetOnlineDisplayList(displayCount, &onlineDisplays, &displayCount)
-        
-        for displayID in onlineDisplays {
-            displayList.append(DisplayData(fromDisplayID: displayID))
-            if menuFontPixelWidth(displayList.last!.label) > largestDisplayLabelPixelWidth {
-                largestDisplayLabelPixelWidth = menuFontPixelWidth(displayList.last!.label)
-            }
-        }
+        displayList = detectDisplays()
         
         /* Build menus */
         configureDisplayMenuParagraphStyle()
         configureResolutionMenuParagraphStyle()
 
-        displayList.sortInPlace({$0.ID < $1.ID})
-        
-        var i = 0
         for display in displayList {
-            menu.addItem(buildDisplayMenu(display.ID, tag: i))
-            i++
+            menu.addItem(buildDisplayMenu(display.ID))
         }
         
         menu.addItem(NSMenuItem.separatorItem())
@@ -391,12 +386,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         statusItem.menu = menu
         
-        callbackIsSet = (CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, nil).rawValue == 1)
+        let registrationResult = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, nil)
+        callbackRegistered = (registrationResult == CGError.Success)
+        
+        if !callbackRegistered {
+            NSLog("Warning: unexpected result when registering callback function (code: \(registrationResult.rawValue))")
+        }
     }
     
     
-    func buildDisplayMenu(displayID: CGDirectDisplayID, tag: Int) -> NSMenuItem {
-        let display = displayList[displayList.indexOf({$0.ID == displayID})!]
+    func detectDisplays() -> [DisplayData] {
+        var displays: [DisplayData] = []
+        var displayCount : UInt32 = 0
+
+        var detectionResult = CGGetOnlineDisplayList(kMaxDisplays, nil, &displayCount)
+        
+        if detectionResult == CGError.Success {
+            var onlineDisplays = [CGDirectDisplayID](count: Int(displayCount), repeatedValue: 0)
+            detectionResult = CGGetOnlineDisplayList(displayCount, &onlineDisplays, &displayCount)
+            
+            if detectionResult == CGError.Success {
+                for displayID in onlineDisplays {
+                    displays.append(DisplayData(fromDisplayID: displayID))
+                }
+                
+                displays.sortInPlace({$0.ID < $1.ID})
+            }
+        }
+        return displays
+    }
+    
+    
+    func getLargestDisplayLabelPixelWidth() -> CGFloat {
+        var labelPixelWidth: CGFloat = 0.0
+        for display in displayList {
+            if menuFontPixelWidth(display.label) > labelPixelWidth {
+                labelPixelWidth = menuFontPixelWidth(display.label)
+            }
+        }
+        return labelPixelWidth
+    }
+    
+    
+    func buildDisplayMenu(displayID: CGDirectDisplayID) -> NSMenuItem {
+       let display = displayList[displayList.indexOf({$0.ID == displayID})!]
         
         let menuItem = NSMenuItem(title: "", action: Selector("nullSelector:"), keyEquivalent: "")
         menuItem.attributedTitle = NSAttributedString(string: display.label + "\t\(display.currentMode.width)\t× \(display.currentMode.height)", attributes: [NSParagraphStyleAttributeName: displayMenuParagraphStyle, NSFontAttributeName: NSFont.menuFontOfSize(0)])
@@ -432,12 +465,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             
             subMenuItem.tag = j
-            subMenuItem.enabled = true
             subMenu.addItem(subMenuItem)
             j++
         }
         
-        menuItem.tag = tag
+        menuItem.tag = Int(displayID)
         menuItem.submenu = subMenu
         
         return menuItem
@@ -455,35 +487,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(aNotification: NSNotification) {
         // Insert code here to tear down your application
-        if callbackIsSet {
-            CGResult = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, nil)
+        if callbackRegistered {
+            let teardownResult = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, nil)
+            if teardownResult != CGError.Success {
+                NSLog("Warning: unexpected result when deregistering callback function (code: \(teardownResult.rawValue))")
+            }
         }
     }
     
     
     func setDisplayMode(sender: AnyObject) {
         let selectedMenuItem = sender as! NSMenuItem
-        let display = displayList[(selectedMenuItem.parentItem?.tag)!]
-        let selectedMode = display.availableModes[selectedMenuItem.tag]
-        var displayConfig = CGDisplayConfigRef.init()
-
-        if selectedMode != display.currentMode {
-            let displayMode: CGDisplayMode = (Array.fromCFArray(CGDisplayCopyAllDisplayModes(display.ID, nil))?.filter({$0 == selectedMode}).first)!
+        if let display = displayList.filter({Int($0.ID) == (selectedMenuItem.parentItem?.tag)}).first {
+            let selectedMode = display.availableModes[selectedMenuItem.tag]
+            var displayConfig = CGDisplayConfigRef.init()
+            var CGResult: CGError
             
-            CGResult = CGBeginDisplayConfiguration(&displayConfig)
-            if CGResult!.rawValue == kCGErrorSuccess {
-                CGResult = CGConfigureDisplayWithDisplayMode(displayConfig, display.ID, displayMode, nil)
-                if CGResult!.rawValue == kCGErrorSuccess {
-                    CGResult = CGCompleteDisplayConfiguration(displayConfig, CGConfigureOption.ForSession)
+            if display.isOnline {
+                if selectedMode != display.currentMode {
+                    let displayMode: CGDisplayMode = (Array.fromCFArray(CGDisplayCopyAllDisplayModes(display.ID, nil))?.filter({$0 == selectedMode}).first)!
+                    
+                    CGResult = CGBeginDisplayConfiguration(&displayConfig)
+                    if CGResult == CGError.Success {
+                        CGResult = CGConfigureDisplayWithDisplayMode(displayConfig, display.ID, displayMode, nil)
+                        if CGResult == CGError.Success {
+                            CGResult = CGCompleteDisplayConfiguration(displayConfig, CGConfigureOption.ForSession)
+                        }
+                    }
+                    
+                    if CGResult == CGError.Success {
+                        let newMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(display.ID)!)
+                        NSLog("Mode changed for display \(display.label) (\(display.ID)); new mode = \(newMode.width) × \(newMode.height) @ \(newMode.refreshRate)Hz")
+                    } else {
+                        NSLog("ERROR: mode not changed for display \(display.label) (\(display.ID)): result (\(CGResult.rawValue))")
+                    }
                 }
-            }
-            
-            if CGResult!.rawValue == kCGErrorSuccess {
-                let newMode = CGDisplayModeTuple(mode: CGDisplayCopyDisplayMode(display.ID)!)
-                NSLog("Mode changed for display \(display.label) (\(display.ID)); new mode = \(newMode.width) × \(newMode.height) @ \(newMode.refreshRate)Hz")
             } else {
-                NSLog("ERROR: mode not changed for display \(display.label) (\(display.ID)): result (\(CGResult!.rawValue))")
+                // display is offline somehow, remove all references?
+                /*
+
+                */
+                
+                NSLog("ERROR: mode change requested for offline display \(display.label) (ID: \(display.ID))")
             }
+        } else {
+            NSLog("ERROR: mode change requested for unscanned display (ID: \(selectedMenuItem.parentItem?.tag))")
         }
     }
     
@@ -492,32 +540,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var displayConfig = CGDisplayConfigRef.init()
         var mirrorTarget = kCGNullDirectDisplay
         
-        CGResult = CGBeginDisplayConfiguration(&displayConfig)
-        if CGResult!.rawValue == kCGErrorSuccess {
+        var mirrorResult = CGBeginDisplayConfiguration(&displayConfig)
+        if mirrorResult == CGError.Success {
             if CGDisplayIsInMirrorSet(CGMainDisplayID()) == 0 {
                 mirrorTarget = CGMainDisplayID()
             }
             for display in displayList {
-                if !display.isMain {
-                    CGResult = CGConfigureDisplayMirrorOfDisplay(displayConfig, display.ID, mirrorTarget)
-                    if CGResult!.rawValue != kCGErrorSuccess {
+                if !display.isMain && display.isOnline {
+                    mirrorResult = CGConfigureDisplayMirrorOfDisplay(displayConfig, display.ID, mirrorTarget)
+                    if mirrorResult != CGError.Success {
                         break
                     }
                 }
             }
-            if CGResult!.rawValue == kCGErrorSuccess {
-                CGResult = CGCompleteDisplayConfiguration(displayConfig, CGConfigureOption.ForSession)
+            if mirrorResult == CGError.Success {
+                mirrorResult = CGCompleteDisplayConfiguration(displayConfig, CGConfigureOption.ForSession)
             }
         }
-        if CGResult!.rawValue == kCGErrorSuccess {
-            NSLog("Mirror toggle result: success (\(CGResult!.rawValue))")
+        if mirrorResult == CGError.Success {
+            NSLog("Mirror toggle result: success (\(mirrorResult.rawValue))")
         } else {
-            NSLog("Mirror toggle result: error (\(CGResult!.rawValue))")
+            NSLog("Mirror toggle result: error (\(mirrorResult.rawValue))")
         }
     }
     
     
     func configureDisplayMenuParagraphStyle() {
+        let newLargestDisplayLabelPixelWidth = getLargestDisplayLabelPixelWidth()
+        
+        if newLargestDisplayLabelPixelWidth != largestDisplayLabelPixelWidth {
+            largestDisplayLabelPixelWidth = newLargestDisplayLabelPixelWidth
+        }
+        
         for tabStop in displayMenuParagraphStyle.tabStops {
             displayMenuParagraphStyle.removeTabStop(tabStop)
         }
@@ -526,7 +580,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         displayMenuParagraphStyle.addTabStop(NSTextTab(type: NSTextTabType.LeftTabStopType, location: displayMenuParagraphStyle.tabStops[0].location + menuFontPixelWidth(" ")))
         displayMenuParagraphStyle.addTabStop(NSTextTab(type: NSTextTabType.LeftTabStopType, location: displayMenuParagraphStyle.tabStops[1].location + menuFontPixelWidth("× 00000") + 30))
     }
-    
+
+
     
     func configureResolutionMenuParagraphStyle() {
         for tabStop in resolutionMenuParagraphStyle.tabStops {
