@@ -15,7 +15,7 @@ Certain parts of the project, notably the functions for obtaining the correct la
 
 # Quirks
 
-The 'permanent' resolution state set by the CLI tool seems to be set on a per-user basis. If you're running the tool from a login hook, or from a Casper policy, or other similar situation where the command is executed as root, you can use 'sudo -u <user> displaycontrol -w <width> -h <height> -p', where <user> is the target user account.
+The 'permanent' resolution state set by the CLI tool seems to be set on a per-user basis. If you're running the tool from a login hook, or from a Casper policy, or other similar situation where the command is executed as root, you can use 'sudo -u user displaycontrol -w width -h height -p', where 'user' is the target user account.
 
 The CLI tool throws an error if the shell user executing the command doesn't have a valid Aqua login session (e.g. using a remote ssh connection), unless the account is 'root'.
 
